@@ -23,25 +23,35 @@
     appId: "1:62914864299:web:db29a9bc07f8a71b0043ee",
   };
 
-  const app = appMod.initializeApp(firebaseConfig);
+  const app  = appMod.initializeApp(firebaseConfig);
   const auth = authMod.getAuth(app);
-  try { await authMod.setPersistence(auth, authMod.browserLocalPersistence); } catch (e) { console.warn("persistence", e); }
-  const db = fsMod.getFirestore(app);
+  try { await authMod.setPersistence(auth, authMod.browserLocalPersistence); }
+  catch (e) { console.warn("persistence", e); }
+  const db   = fsMod.getFirestore(app);
 
-  const LOCAL_KEY = "microgreens_calc_unified";
+  const LOCAL_KEY     = "microgreens_calc_unified";
   const OVERRIDES_KEY = "shim_form_overrides";
 
-  function collectLocal() {
-    try {
-      const single = localStorage.getItem(LOCAL_KEY);
-      if (single) return { [LOCAL_KEY]: single, [OVERRIDES_KEY]: localStorage.getItem(OVERRIDES_KEY) };
-    } catch {}
-    const s = {};
+  // --- Optional: purge any illegal keys immediately so local state stays tidy
+  (function purgeIllegalLocalKeys(){
+    const bad = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      s[k] = localStorage.getItem(k);
+      if (/^__.*__$/.test(k)) bad.push(k); // Firestore forbids keys that begin AND end with "__"
     }
-    return s;
+    bad.forEach(k => localStorage.removeItem(k));
+  })();
+
+  // --- Build state from localStorage, skipping illegal keys for Firestore
+  function collectLocal() {
+    const out = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (/^__.*__$/.test(k)) continue;       // skip keys like "__cloud_wrapped__"
+      const v = localStorage.getItem(k);
+      if (typeof v === "string") out[k] = v;
+    }
+    return out;
   }
 
   function applyLocal(state, opts) {
@@ -81,7 +91,7 @@
     } catch (e) { console.error(e); }
   }
 
-  // Autosave when localStorage changes
+  // --- Autosave when localStorage changes
   let timer = null;
   function schedule(ms) {
     if (!auth.currentUser) return;
@@ -95,7 +105,7 @@
   const _cl = localStorage.clear.bind(localStorage);
   localStorage.clear = function () { try { _cl(); } finally { schedule(800); } };
 
-  // Capture inputs the app might not persist
+  // --- Capture inputs the app might not persist (assumptions/inputs etc.)
   function stableKey(el) { return el.id || el.name || el.getAttribute("data-field") || null; }
   function storeOverride(el) {
     const key = stableKey(el); if (!key) return;
@@ -128,7 +138,64 @@
   function applyOverridesSoon() { setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
   document.addEventListener("DOMContentLoaded", applyOverridesSoon);
 
-  // Public API
+  // --- Route your UI login buttons to Firebase; block legacy Supabase /auth/v1/ calls
+  (function wireAuthButtonsAndBlockLegacy(){
+    // Block any lingering Supabase auth calls so they can't interfere
+    const SUPA_AUTH_PATH = '/auth/v1/';
+    const origFetch = window.fetch;
+    window.fetch = async (input, init) => {
+      try {
+        const url = (typeof input === 'string') ? input : (input && input.url) || '';
+        if (url.includes(SUPA_AUTH_PATH)) {
+          console.warn('[shim] blocked legacy supabase call:', url);
+          return new Response(JSON.stringify({ error: 'blocked by firebase shim' }), {
+            status: 410, headers: { 'content-type': 'application/json' }
+          });
+        }
+      } catch {}
+      return origFetch(input, init);
+    };
+
+    function getCreds() {
+      const email = document.querySelector('#gate-email')?.value?.trim() || '';
+      const pass  = document.querySelector('#gate-password')?.value || '';
+      return { email, pass };
+    }
+    async function doSignIn(ev) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); }
+      const { email, pass } = getCreds();
+      try {
+        await authMod.signInWithEmailAndPassword(auth, email, pass);
+        console.log('[auth] signed in as', auth.currentUser?.email);
+      } catch (e) {
+        console.error('[auth] sign-in failed', e);
+      }
+    }
+    async function doSignUp(ev) {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); }
+      const { email, pass } = getCreds();
+      try {
+        await authMod.createUserWithEmailAndPassword(auth, email, pass);
+        console.log('[auth] account created for', auth.currentUser?.email);
+      } catch (e) {
+        if (e.code === 'auth/email-already-in-use') {
+          console.warn('[auth] already exists — attempting sign-in');
+          try { await authMod.signInWithEmailAndPassword(auth, email, pass); }
+          catch (e2) { console.error('[auth] sign-in after exists failed', e2); }
+        } else {
+          console.error('[auth] sign-up failed', e);
+        }
+      }
+    }
+    const signInBtn = document.querySelector('#gate-signin');
+    const signUpBtn = document.querySelector('#gate-signup') || document.querySelector('[data-create-account]');
+    signInBtn && signInBtn.addEventListener('click', doSignIn, true); // capture to preempt old handlers
+    signUpBtn && signUpBtn.addEventListener('click', doSignUp, true);
+
+    authMod.onAuthStateChanged(auth, (u) => console.log('[auth state]', u?.email || 'signed out'));
+  })();
+
+  // --- Public API
   window.saveToCloud   = saveToCloud;
   window.loadFromCloud = function(){ return loadFromCloud({ reload: true }); };
   window.__debugCloud  = async function () {
