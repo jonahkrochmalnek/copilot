@@ -32,7 +32,7 @@
   const LOCAL_KEY     = "microgreens_calc_unified";
   const OVERRIDES_KEY = "shim_form_overrides";
 
-  // --- Optional: purge any illegal keys immediately so local state stays tidy
+  // --- Optional: purge illegal localStorage keys so Firestore writes never fail
   (function purgeIllegalLocalKeys(){
     const bad = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -42,12 +42,12 @@
     bad.forEach(k => localStorage.removeItem(k));
   })();
 
-  // --- Build state from localStorage, skipping illegal keys for Firestore
+  // --- Build state from localStorage, skipping illegal keys
   function collectLocal() {
     const out = {};
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (/^__.*__$/.test(k)) continue;       // skip keys like "__cloud_wrapped__"
+      if (/^__.*__$/.test(k)) continue; // skip "__cloud_wrapped__" etc.
       const v = localStorage.getItem(k);
       if (typeof v === "string") out[k] = v;
     }
@@ -138,6 +138,20 @@
   function applyOverridesSoon() { setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
   document.addEventListener("DOMContentLoaded", applyOverridesSoon);
 
+  // --- Reveal main UI after successful Firebase auth
+  async function revealAppUI(user) {
+    try { document.body.classList.add('authed'); } catch {}
+    // Hide common gate/login wrappers if present
+    ['#gate','#login','#login-panel','#gate-card','.auth-panel','.gate','.signin-card']
+      .forEach(sel => { const n = document.querySelector(sel); if (n) n.style.setProperty('display','none','important'); });
+    const who = document.querySelector('#whoami');
+    if (who && user?.email) who.textContent = `Signed in as ${user.email}`;
+    // Pull cloud -> local and refresh UI
+    try { await loadFromCloud({ reload: true }); } catch { try { location.reload(); } catch {} }
+    // Also let any app code listen
+    try { window.dispatchEvent(new CustomEvent('firebase-auth-success',{detail:{email:user?.email||null}})); } catch {}
+  }
+
   // --- Route your UI login buttons to Firebase; block legacy Supabase /auth/v1/ calls
   (function wireAuthButtonsAndBlockLegacy(){
     // Block any lingering Supabase auth calls so they can't interfere
@@ -161,38 +175,51 @@
       const pass  = document.querySelector('#gate-password')?.value || '';
       return { email, pass };
     }
+
     async function doSignIn(ev) {
       if (ev) { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); }
       const { email, pass } = getCreds();
       try {
         await authMod.signInWithEmailAndPassword(auth, email, pass);
         console.log('[auth] signed in as', auth.currentUser?.email);
+        await revealAppUI(auth.currentUser);
       } catch (e) {
         console.error('[auth] sign-in failed', e);
       }
     }
+
     async function doSignUp(ev) {
       if (ev) { ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation(); }
       const { email, pass } = getCreds();
       try {
         await authMod.createUserWithEmailAndPassword(auth, email, pass);
         console.log('[auth] account created for', auth.currentUser?.email);
+        await revealAppUI(auth.currentUser);
       } catch (e) {
         if (e.code === 'auth/email-already-in-use') {
           console.warn('[auth] already exists — attempting sign-in');
-          try { await authMod.signInWithEmailAndPassword(auth, email, pass); }
-          catch (e2) { console.error('[auth] sign-in after exists failed', e2); }
+          try {
+            await authMod.signInWithEmailAndPassword(auth, email, pass);
+            await revealAppUI(auth.currentUser);
+          } catch (e2) { console.error('[auth] sign-in after exists failed', e2); }
         } else {
           console.error('[auth] sign-up failed', e);
         }
       }
     }
+
     const signInBtn = document.querySelector('#gate-signin');
     const signUpBtn = document.querySelector('#gate-signup') || document.querySelector('[data-create-account]');
     signInBtn && signInBtn.addEventListener('click', doSignIn, true); // capture to preempt old handlers
     signUpBtn && signUpBtn.addEventListener('click', doSignUp, true);
 
-    authMod.onAuthStateChanged(auth, (u) => console.log('[auth state]', u?.email || 'signed out'));
+    authMod.onAuthStateChanged(auth, async (u) => {
+      console.log('[auth state]', u?.email || 'signed out');
+      if (u) {
+        // If user is already signed in on load, reveal UI automatically
+        await revealAppUI(u);
+      }
+    });
   })();
 
   // --- Public API
