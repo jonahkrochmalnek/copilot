@@ -8,8 +8,22 @@
   if (window.__FIREBASE_SUPA_SHIM__) return;
   window.__FIREBASE_SUPA_SHIM__ = true;
 
-  // So we hide gate ASAP even before auth settles
+  // Hide gate ASAP before auth settles (reduces flicker)
   try { document.body.classList.add('auth-initializing'); } catch {}
+
+  // One-time SW + cache cleanup (fixes Chrome-regular stale assets causing flip/flop)
+  (async () => {
+    try {
+      if (navigator.serviceWorker) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        regs.forEach(r => r.unregister().catch(()=>{}));
+      }
+      if (window.caches && typeof caches.keys === 'function') {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k).catch(()=>{})));
+      }
+    } catch (e) { /* silent */ }
+  })();
 
   const [appMod, authMod, fsMod] = await Promise.all([
     import("https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js"),
@@ -38,11 +52,10 @@
   // Track first successful cloud->local pull (prevents pre-pull autosave)
   let FIRST_PULL_DONE = !!sessionStorage.getItem("mg_cloud_applied");
 
-  // --- Anti-flicker CSS (keep gate hidden when authed; also hide during init)
+  // --- Anti-flicker CSS (keep gate hidden during init and when authed)
   (function injectAuthCss(){
     const s = document.createElement('style');
     s.textContent = `
-      /* Hide gate during initializing and when authed */
       .auth-initializing #gate, .auth-initializing #login, .auth-initializing .gate,
       .auth-initializing .auth-panel, .auth-initializing .signin-card, .auth-initializing #login-panel, .auth-initializing #gate-card,
       .authed #gate, .authed #login, .authed .gate,
@@ -53,10 +66,10 @@
     document.head.appendChild(s);
   })();
 
-  // Continuous enforcer (if legacy code tries to re-show the gate, hide it back)
+  // Continuous enforcer: if legacy code re-inserts the gate, hide it again
   const GATE_SELECTORS = ['#gate','#login','#login-panel','#gate-card','.auth-panel','.gate','.signin-card'];
   function hideGatesHard() {
-    if (!document.body.classList.contains('authed')) return;
+    if (!document.body.classList.contains('authed')) return requestAnimationFrame(hideGatesHard);
     for (const sel of GATE_SELECTORS) {
       document.querySelectorAll(sel).forEach(n => {
         n.style.setProperty('display','none','important');
@@ -67,17 +80,15 @@
     requestAnimationFrame(hideGatesHard);
   }
   requestAnimationFrame(hideGatesHard);
-
-  // Also watch DOM mutations to re-hide any newly inserted gate
-  const mo = new MutationObserver(() => hideGatesHard());
-  mo.observe(document.documentElement, { childList:true, subtree:true });
+  new MutationObserver(() => hideGatesHard())
+    .observe(document.documentElement, { childList:true, subtree:true });
 
   // --- Optional: purge illegal localStorage keys so Firestore writes never fail
   (function purgeIllegalLocalKeys(){
     const bad = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (/^__.*__$/.test(k)) bad.push(k); // Firestore forbids keys that begin AND end with "__"
+      if (/^__.*__$/.test(k)) bad.push(k);
     }
     bad.forEach(k => localStorage.removeItem(k));
   })();
@@ -87,7 +98,7 @@
     const out = {};
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (/^__.*__$/.test(k)) continue; // skip "__cloud_wrapped__" etc.
+      if (/^__.*__$/.test(k)) continue;
       const v = localStorage.getItem(k);
       if (typeof v === "string") out[k] = v;
     }
@@ -102,21 +113,17 @@
       const v = state[k];
       if (typeof v === "string") localStorage.setItem(k, v);
     }
-    // Mark first pull as complete for this tab/session
     FIRST_PULL_DONE = true;
     sessionStorage.setItem("mg_cloud_applied", "1");
-    // Leave initializing state
     try { document.body.classList.remove('auth-initializing'); } catch {}
-
     if (opts.reload && !document.documentElement.dataset.mgReloading) {
-      document.documentElement.dataset.mgReloading = "1"; // prevent double-reload loops
+      document.documentElement.dataset.mgReloading = "1";
       try { location.reload(); } catch {}
     }
   }
 
   async function saveToCloud() {
     const u = auth.currentUser; if (!u) return;
-    // HARD GUARD: never save until this tab has completed its first pull
     if (!FIRST_PULL_DONE || !sessionStorage.getItem("mg_cloud_applied")) {
       console.warn("[shim] save skipped; waiting for first cloud load");
       return;
@@ -139,7 +146,6 @@
         const d = snap.data();
         applyLocal((d && d.state) || {}, opts);
       } else {
-        // No doc yet; mark first pull so this tab can start saving
         FIRST_PULL_DONE = true;
         sessionStorage.setItem("mg_cloud_applied", "1");
         try { document.body.classList.remove('auth-initializing'); } catch {}
@@ -206,7 +212,6 @@
     UI_REVEALED = true;
 
     try { document.body.classList.add('authed'); } catch {}
-    // Hide/remove common gate/login wrappers if present
     for (const sel of GATE_SELECTORS) {
       document.querySelectorAll(sel).forEach(n => {
         n.style.setProperty('display','none','important');
@@ -217,7 +222,6 @@
     const who = document.querySelector('#whoami');
     if (who && user?.email) who.textContent = `Signed in as ${user.email}`;
 
-    // First pull (reload once); guards in loadFromCloud prevent loops
     try { await loadFromCloud({ reload: true }); } catch { try { location.reload(); } catch {} }
 
     try { window.dispatchEvent(new CustomEvent('firebase-auth-success',{detail:{email:user?.email||null}})); } catch {}
@@ -243,15 +247,40 @@
   };
   window.supabase.auth.signOut = async () => { try { await authMod.signOut(auth); } catch {} ; return { error: null }; };
 
+  // --- ALSO hijack any already-created Supabase clients (Chrome-regular only issue)
+  (function hijackExistingSupabaseClients(){
+    try {
+      const compat = {
+        getUser: window.supabase?.auth?.getUser,
+        getSession: window.supabase?.auth?.getSession,
+        onAuthStateChange: window.supabase?.auth?.onAuthStateChange,
+        signOut: window.supabase?.auth?.signOut,
+      };
+      const seen = new Set();
+      for (const k in window) {
+        const v = window[k];
+        if (!v || typeof v !== 'object') continue;
+        if (seen.has(v)) continue; seen.add(v);
+        if (v.auth && typeof v.auth === 'object' && typeof v.from === 'function') {
+          try {
+            v.auth.getUser = compat.getUser;
+            v.auth.getSession = compat.getSession;
+            v.auth.onAuthStateChange = compat.onAuthStateChange;
+            v.auth.signOut = compat.signOut;
+          } catch {}
+        }
+      }
+    } catch {}
+  })();
+
   // --- Route your UI login buttons to Firebase; block legacy Supabase /auth/v1/ calls
   (function wireAuthButtonsAndBlockLegacy(){
-    // Block any lingering Supabase auth calls so they can't interfere
     const SUPA_AUTH_PATH = '/auth/v1/';
     const origFetch = window.fetch;
     window.fetch = async (input, init) => {
       try {
         const url = (typeof input === 'string') ? input : (input && input.url) || '';
-        if (url.includes(SUPA_AUTH_PATH)) {
+        if (url && (url.includes(SUPA_AUTH_PATH))) {
           console.warn('[shim] blocked legacy supabase call:', url);
           return new Response(JSON.stringify({ error: 'blocked by firebase shim' }), {
             status: 410, headers: { 'content-type': 'application/json' }
@@ -301,7 +330,7 @@
 
     const signInBtn = document.querySelector('#gate-signin');
     const signUpBtn = document.querySelector('#gate-signup') || document.querySelector('[data-create-account]');
-    signInBtn && signInBtn.addEventListener('click', doSignIn, true); // capture to preempt old handlers
+    signInBtn && signInBtn.addEventListener('click', doSignIn, true);
     signUpBtn && signUpBtn.addEventListener('click', doSignUp, true);
 
     authMod.onAuthStateChanged(auth, async (u) => {
@@ -326,7 +355,6 @@
       if (auth.currentUser && !sessionStorage.getItem('mg_cloud_applied') && !UI_REVEALED) {
         await loadFromCloud({ reload: true });
       } else {
-        // done initializing state once load fires
         try { document.body.classList.remove('auth-initializing'); } catch {}
       }
     } catch (e) { console.warn('initial cloud pull on load failed', e); }
