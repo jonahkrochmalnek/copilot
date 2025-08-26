@@ -1,137 +1,137 @@
-<script type="module">
-// firebase-supabase-shim.v4.js (inline)
-// Exposes:
-//   window.saveToCloud()    // push local -> cloud
-//   window.loadFromCloud()  // pull cloud -> local (reloads UI)
-//   window.__debugCloud()   // log cloud size + updated_at
+// firebase-supabase-shim.v4.js
+// Exposes on window:
+//   saveToCloud()    -> push local -> Firestore
+//   loadFromCloud()  -> pull Firestore -> local (reloads UI)
+//   __debugCloud()   -> logs cloud size + updated_at
 
-(async function(){
-  if (window.__FIREBASE_SUPA_SHIM__) return; window.__FIREBASE_SUPA_SHIM__ = true;
+(async function () {
+  if (window.__FIREBASE_SUPA_SHIM__) return;
+  window.__FIREBASE_SUPA_SHIM__ = true;
 
   const [appMod, authMod, fsMod] = await Promise.all([
     import("https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js"),
     import("https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js"),
-    import("https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js")
+    import("https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js"),
   ]);
 
-  // YOUR Firebase config
   const firebaseConfig = {
     apiKey: "AIzaSyBXOQCdSTvFah9_3UFDc551Z1DV0FJHxrE",
     authDomain: "microgreenscopilot.firebaseapp.com",
     projectId: "microgreenscopilot",
     storageBucket: "microgreenscopilot.firebasestorage.app",
     messagingSenderId: "62914864299",
-    appId: "1:62914864299:web:db29a9bc07f8a71b0043ee"
+    appId: "1:62914864299:web:db29a9bc07f8a71b0043ee",
   };
 
-  const app  = appMod.initializeApp(firebaseConfig);
+  const app = appMod.initializeApp(firebaseConfig);
   const auth = authMod.getAuth(app);
-  try { await authMod.setPersistence(auth, authMod.browserLocalPersistence); } catch(e) { console.warn("persistence", e); }
-  const db   = fsMod.getFirestore(app);
+  try { await authMod.setPersistence(auth, authMod.browserLocalPersistence); } catch (e) { console.warn("persistence", e); }
+  const db = fsMod.getFirestore(app);
 
-  const LOCAL_KEY     = "microgreens_calc_unified";
+  const LOCAL_KEY = "microgreens_calc_unified";
   const OVERRIDES_KEY = "shim_form_overrides";
 
-  function collectLocal(){
+  function collectLocal() {
     try {
       const single = localStorage.getItem(LOCAL_KEY);
       if (single) return { [LOCAL_KEY]: single, [OVERRIDES_KEY]: localStorage.getItem(OVERRIDES_KEY) };
-    } catch(e){}
+    } catch {}
     const s = {};
-    for (let i=0;i<localStorage.length;i++){
+    for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       s[k] = localStorage.getItem(k);
     }
     return s;
   }
 
-  function applyLocal(state, opts){
+  function applyLocal(state, opts) {
     opts = opts || { reload: false };
     if (!state) return;
-    try { localStorage.clear(); } catch(e){}
-    for (const k in state){
+    try { localStorage.clear(); } catch {}
+    for (const k in state) {
       const v = state[k];
       if (typeof v === "string") localStorage.setItem(k, v);
     }
-    if (opts.reload && !sessionStorage.getItem("mg_cloud_applied")){
+    if (opts.reload && !sessionStorage.getItem("mg_cloud_applied")) {
       sessionStorage.setItem("mg_cloud_applied", "1");
-      try { location.reload(); } catch(e){}
+      try { location.reload(); } catch {}
     }
   }
 
-  async function saveToCloud(){
+  async function saveToCloud() {
     const u = auth.currentUser; if (!u) return;
     try {
-      await fsMod.setDoc(fsMod.doc(db, "app_state", u.uid), {
-        state: collectLocal(),
-        updated_at: fsMod.serverTimestamp()
-      }, { merge: true });
-    } catch(e){ console.error(e); }
+      await fsMod.setDoc(
+        fsMod.doc(db, "app_state", u.uid),
+        { state: collectLocal(), updated_at: fsMod.serverTimestamp() },
+        { merge: true }
+      );
+    } catch (e) { console.error(e); }
   }
 
-  async function loadFromCloud(opts){
+  async function loadFromCloud(opts) {
     opts = opts || { reload: true };
     const u = auth.currentUser; if (!u) return;
     try {
       const snap = await fsMod.getDoc(fsMod.doc(db, "app_state", u.uid));
-      if (snap.exists()){
+      if (snap.exists()) {
         const d = snap.data();
         applyLocal((d && d.state) || {}, opts);
       }
-    } catch(e){ console.error(e); }
+    } catch (e) { console.error(e); }
   }
 
   // Autosave when localStorage changes
   let timer = null;
-  function schedule(ms){
+  function schedule(ms) {
     if (!auth.currentUser) return;
     clearTimeout(timer);
-    timer = setTimeout(function(){ saveToCloud(); }, Math.max(300, ms || 1200));
+    timer = setTimeout(() => saveToCloud(), Math.max(300, ms || 1200));
   }
   const _si = localStorage.setItem.bind(localStorage);
-  localStorage.setItem = function(k,v){ try{ _si(k,v); } finally { schedule(800); } };
+  localStorage.setItem = function (k, v) { try { _si(k, v); } finally { schedule(800); } };
   const _ri = localStorage.removeItem.bind(localStorage);
-  localStorage.removeItem = function(k){ try{ _ri(k); } finally { schedule(800); } };
+  localStorage.removeItem = function (k) { try { _ri(k); } finally { schedule(800); } };
   const _cl = localStorage.clear.bind(localStorage);
-  localStorage.clear = function(){ try{ _cl(); } finally { schedule(800); } };
+  localStorage.clear = function () { try { _cl(); } finally { schedule(800); } };
 
-  // Capture inputs the app itself might not persist (assumptions/inputs)
-  function stableKey(el){ return el.id || el.name || el.getAttribute("data-field") || null; }
-  function storeOverride(el){
+  // Capture inputs the app might not persist
+  function stableKey(el) { return el.id || el.name || el.getAttribute("data-field") || null; }
+  function storeOverride(el) {
     const key = stableKey(el); if (!key) return;
     let bag = {};
-    try { bag = JSON.parse(localStorage.getItem(OVERRIDES_KEY) || "{}"); } catch(e){}
+    try { bag = JSON.parse(localStorage.getItem(OVERRIDES_KEY) || "{}"); } catch {}
     const v = (el.type === "checkbox") ? !!el.checked : el.value;
     bag[key] = v;
-    try { localStorage.setItem(OVERRIDES_KEY, JSON.stringify(bag)); } catch(e){}
+    try { localStorage.setItem(OVERRIDES_KEY, JSON.stringify(bag)); } catch {}
     schedule(600);
   }
-  document.addEventListener("input",  function(e){ const t=e.target; if(t) storeOverride(t); }, true);
-  document.addEventListener("change", function(e){ const t=e.target; if(t) storeOverride(t); }, true);
-  document.addEventListener("blur",   function(e){ const t=e.target; if(t) storeOverride(t); }, true);
+  document.addEventListener("input",  e => { const t = e.target; if (t) storeOverride(t); }, true);
+  document.addEventListener("change", e => { const t = e.target; if (t) storeOverride(t); }, true);
+  document.addEventListener("blur",   e => { const t = e.target; if (t) storeOverride(t); }, true);
 
-  function applyOverrides(){
+  function applyOverrides() {
     let bag = null;
-    try { bag = JSON.parse(localStorage.getItem(OVERRIDES_KEY) || "null"); } catch(e){}
+    try { bag = JSON.parse(localStorage.getItem(OVERRIDES_KEY) || "null"); } catch {}
     if (!bag) return;
-    Object.keys(bag).forEach(function(key){
+    Object.keys(bag).forEach(key => {
       let el = document.getElementById(key);
-      if (!el) el = document.querySelector('[name="'+CSS.escape(key)+'"]');
+      if (!el) el = document.querySelector('[name="' + CSS.escape(key) + '"]');
       if (!el) return;
       const v = bag[key];
       if (el.type === "checkbox") el.checked = !!v; else el.value = v;
-      try { el.dispatchEvent(new Event("input",  { bubbles: true })); } catch(e){}
-      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch(e){}
-      try { el.blur(); } catch(e){}
+      try { el.dispatchEvent(new Event("input",  { bubbles: true })); } catch {}
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+      try { el.blur(); } catch {}
     });
   }
-  function applyOverridesSoon(){ setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
+  function applyOverridesSoon() { setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
   document.addEventListener("DOMContentLoaded", applyOverridesSoon);
 
   // Public API
-  window.saveToCloud  = saveToCloud;
+  window.saveToCloud   = saveToCloud;
   window.loadFromCloud = function(){ return loadFromCloud({ reload: true }); };
-  window.__debugCloud = async function(){
+  window.__debugCloud  = async function () {
     const u = auth.currentUser; if (!u) return console.log("Not signed in");
     const snap = await fsMod.getDoc(fsMod.doc(db, "app_state", u.uid));
     if (!snap.exists()) return console.log("No cloud doc");
@@ -141,5 +141,3 @@
     return data;
   };
 })();
-</script>
-
