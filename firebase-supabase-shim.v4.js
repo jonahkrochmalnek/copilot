@@ -32,6 +32,9 @@
   const LOCAL_KEY     = "microgreens_calc_unified";
   const OVERRIDES_KEY = "shim_form_overrides";
 
+  // Flag that says "this tab has already pulled cloud -> local at least once"
+  let FIRST_PULL_DONE = !!sessionStorage.getItem("mg_cloud_applied");
+
   // --- Optional: purge illegal localStorage keys so Firestore writes never fail
   (function purgeIllegalLocalKeys(){
     const bad = [];
@@ -62,14 +65,24 @@
       const v = state[k];
       if (typeof v === "string") localStorage.setItem(k, v);
     }
-    if (opts.reload && !sessionStorage.getItem("mg_cloud_applied")) {
-      sessionStorage.setItem("mg_cloud_applied", "1");
+    // Mark first pull as complete for this tab/session
+    FIRST_PULL_DONE = true;
+    sessionStorage.setItem("mg_cloud_applied", "1");
+
+    if (opts.reload && !document.documentElement.dataset.mgReloading) {
+      // prevent double-reload loops
+      document.documentElement.dataset.mgReloading = "1";
       try { location.reload(); } catch {}
     }
   }
 
   async function saveToCloud() {
     const u = auth.currentUser; if (!u) return;
+    // HARD GUARD: never save until this tab has completed its first pull
+    if (!FIRST_PULL_DONE || !sessionStorage.getItem("mg_cloud_applied")) {
+      console.warn("[shim] save skipped; waiting for first cloud load");
+      return;
+    }
     try {
       await fsMod.setDoc(
         fsMod.doc(db, "app_state", u.uid),
@@ -87,14 +100,23 @@
       if (snap.exists()) {
         const d = snap.data();
         applyLocal((d && d.state) || {}, opts);
+      } else {
+        // No doc yet; mark first pull so this tab can start saving
+        FIRST_PULL_DONE = true;
+        sessionStorage.setItem("mg_cloud_applied", "1");
+        if (opts.reload && !document.documentElement.dataset.mgReloading) {
+          document.documentElement.dataset.mgReloading = "1";
+          try { location.reload(); } catch {}
+        }
       }
     } catch (e) { console.error(e); }
   }
 
-  // --- Autosave when localStorage changes
+  // --- Autosave when localStorage changes (BLOCKED until first pull)
   let timer = null;
   function schedule(ms) {
     if (!auth.currentUser) return;
+    if (!FIRST_PULL_DONE || !sessionStorage.getItem("mg_cloud_applied")) return;
     clearTimeout(timer);
     timer = setTimeout(() => saveToCloud(), Math.max(300, ms || 1200));
   }
@@ -148,7 +170,7 @@
     if (who && user?.email) who.textContent = `Signed in as ${user.email}`;
     // Pull cloud -> local and refresh UI
     try { await loadFromCloud({ reload: true }); } catch { try { location.reload(); } catch {} }
-    // Also let any app code listen
+    // Notify listeners
     try { window.dispatchEvent(new CustomEvent('firebase-auth-success',{detail:{email:user?.email||null}})); } catch {}
   }
 
@@ -167,7 +189,7 @@
           });
         }
       } catch {}
-      return origFetch(input, init);
+      return origFetch.call(this, input, init);
     };
 
     function getCreds() {
@@ -215,12 +237,18 @@
 
     authMod.onAuthStateChanged(auth, async (u) => {
       console.log('[auth state]', u?.email || 'signed out');
-      if (u) {
-        // If user is already signed in on load, reveal UI automatically
-        await revealAppUI(u);
-      }
+      if (u) { await revealAppUI(u); }
     });
   })();
+
+  // --- If the page loads already authed, pull once automatically
+  window.addEventListener('load', async () => {
+    try {
+      if (auth.currentUser && !sessionStorage.getItem('mg_cloud_applied')) {
+        await loadFromCloud({ reload: true });
+      }
+    } catch (e) { console.warn('initial cloud pull on load failed', e); }
+  });
 
   // --- Public API
   window.saveToCloud   = saveToCloud;
