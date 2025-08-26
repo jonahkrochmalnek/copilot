@@ -8,6 +8,9 @@
   if (window.__FIREBASE_SUPA_SHIM__) return;
   window.__FIREBASE_SUPA_SHIM__ = true;
 
+  // So we hide gate ASAP even before auth settles
+  try { document.body.classList.add('auth-initializing'); } catch {}
+
   const [appMod, authMod, fsMod] = await Promise.all([
     import("https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js"),
     import("https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js"),
@@ -35,18 +38,39 @@
   // Track first successful cloud->local pull (prevents pre-pull autosave)
   let FIRST_PULL_DONE = !!sessionStorage.getItem("mg_cloud_applied");
 
-  // --- Anti-flicker: reveal app once and keep gate hidden when authed
-  let UI_REVEALED = false;
+  // --- Anti-flicker CSS (keep gate hidden when authed; also hide during init)
   (function injectAuthCss(){
     const s = document.createElement('style');
     s.textContent = `
+      /* Hide gate during initializing and when authed */
+      .auth-initializing #gate, .auth-initializing #login, .auth-initializing .gate,
+      .auth-initializing .auth-panel, .auth-initializing .signin-card, .auth-initializing #login-panel, .auth-initializing #gate-card,
       .authed #gate, .authed #login, .authed .gate,
       .authed .auth-panel, .authed .signin-card, .authed #login-panel, .authed #gate-card {
-        display: none !important;
+        display: none !important; visibility: hidden !important; pointer-events: none !important;
       }
     `;
     document.head.appendChild(s);
   })();
+
+  // Continuous enforcer (if legacy code tries to re-show the gate, hide it back)
+  const GATE_SELECTORS = ['#gate','#login','#login-panel','#gate-card','.auth-panel','.gate','.signin-card'];
+  function hideGatesHard() {
+    if (!document.body.classList.contains('authed')) return;
+    for (const sel of GATE_SELECTORS) {
+      document.querySelectorAll(sel).forEach(n => {
+        n.style.setProperty('display','none','important');
+        n.hidden = true;
+        n.setAttribute('aria-hidden','true');
+      });
+    }
+    requestAnimationFrame(hideGatesHard);
+  }
+  requestAnimationFrame(hideGatesHard);
+
+  // Also watch DOM mutations to re-hide any newly inserted gate
+  const mo = new MutationObserver(() => hideGatesHard());
+  mo.observe(document.documentElement, { childList:true, subtree:true });
 
   // --- Optional: purge illegal localStorage keys so Firestore writes never fail
   (function purgeIllegalLocalKeys(){
@@ -81,10 +105,11 @@
     // Mark first pull as complete for this tab/session
     FIRST_PULL_DONE = true;
     sessionStorage.setItem("mg_cloud_applied", "1");
+    // Leave initializing state
+    try { document.body.classList.remove('auth-initializing'); } catch {}
 
     if (opts.reload && !document.documentElement.dataset.mgReloading) {
-      // prevent double-reload loops
-      document.documentElement.dataset.mgReloading = "1";
+      document.documentElement.dataset.mgReloading = "1"; // prevent double-reload loops
       try { location.reload(); } catch {}
     }
   }
@@ -117,6 +142,7 @@
         // No doc yet; mark first pull so this tab can start saving
         FIRST_PULL_DONE = true;
         sessionStorage.setItem("mg_cloud_applied", "1");
+        try { document.body.classList.remove('auth-initializing'); } catch {}
         if (opts.reload && !document.documentElement.dataset.mgReloading) {
           document.documentElement.dataset.mgReloading = "1";
           try { location.reload(); } catch {}
@@ -173,14 +199,21 @@
   function applyOverridesSoon() { setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
   document.addEventListener("DOMContentLoaded", applyOverridesSoon);
 
-  // --- Reveal main UI after successful Firebase auth (debounced)
+  // --- Reveal main UI after successful Firebase auth (debounced & gate-removed)
+  let UI_REVEALED = false;
   async function revealAppUI(user) {
     if (UI_REVEALED) return;
     UI_REVEALED = true;
 
     try { document.body.classList.add('authed'); } catch {}
-    ['#gate','#login','#login-panel','#gate-card','.auth-panel','.gate','.signin-card']
-      .forEach(sel => { const n = document.querySelector(sel); if (n) n.style.setProperty('display','none','important'); });
+    // Hide/remove common gate/login wrappers if present
+    for (const sel of GATE_SELECTORS) {
+      document.querySelectorAll(sel).forEach(n => {
+        n.style.setProperty('display','none','important');
+        n.hidden = true; n.setAttribute('aria-hidden','true');
+        try { n.remove(); } catch {}
+      });
+    }
     const who = document.querySelector('#whoami');
     if (who && user?.email) who.textContent = `Signed in as ${user.email}`;
 
@@ -273,8 +306,17 @@
 
     authMod.onAuthStateChanged(auth, async (u) => {
       console.log('[auth state]', u?.email || 'signed out');
-      if (u) { await revealAppUI(u); }
-      else { UI_REVEALED = false; try { document.body.classList.remove('authed'); } catch {} }
+      if (u) {
+        try { document.body.classList.remove('auth-initializing'); } catch {}
+        await revealAppUI(u);
+      } else {
+        // Signed out: allow gate to show again (no flicker)
+        UI_REVEALED = false;
+        try {
+          document.body.classList.remove('authed');
+          document.body.classList.remove('auth-initializing');
+        } catch {}
+      }
     });
   })();
 
@@ -283,6 +325,9 @@
     try {
       if (auth.currentUser && !sessionStorage.getItem('mg_cloud_applied') && !UI_REVEALED) {
         await loadFromCloud({ reload: true });
+      } else {
+        // done initializing state once load fires
+        try { document.body.classList.remove('auth-initializing'); } catch {}
       }
     } catch (e) { console.warn('initial cloud pull on load failed', e); }
   });
@@ -300,4 +345,3 @@
     return data;
   };
 })();
-
