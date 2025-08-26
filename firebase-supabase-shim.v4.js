@@ -1,7 +1,7 @@
-// firebase-supabase-shim.v4.js
+// firebase-supabase-shim.v4.js (v16)
 // Exposes on window:
 //   saveToCloud()    -> push local -> Firestore
-//   loadFromCloud()  -> pull Firestore -> local (reloads UI)
+//   loadFromCloud()  -> pull Firestore -> local (reloads UI on FIRST pull only)
 //   __debugCloud()   -> logs cloud size + updated_at
 
 (async function () {
@@ -11,7 +11,7 @@
   // Hide gate ASAP before auth settles (reduces flicker)
   try { document.body.classList.add('auth-initializing'); } catch {}
 
-  // One-time SW + cache cleanup (fixes Chrome-regular stale assets causing flip/flop)
+  // One-time SW + cache cleanup (helps Chrome regular profile)
   (async () => {
     try {
       if (navigator.serviceWorker) {
@@ -22,7 +22,7 @@
         const keys = await caches.keys();
         await Promise.all(keys.map(k => caches.delete(k).catch(()=>{})));
       }
-    } catch (e) { /* silent */ }
+    } catch {}
   })();
 
   const [appMod, authMod, fsMod] = await Promise.all([
@@ -51,8 +51,9 @@
 
   // Track first successful cloud->local pull (prevents pre-pull autosave)
   let FIRST_PULL_DONE = !!sessionStorage.getItem("mg_cloud_applied");
+  let UI_REVEALED = false;
 
-  // --- Anti-flicker CSS (keep gate hidden during init and when authed)
+  // Anti-flicker CSS: hide gate during init and when authed
   (function injectAuthCss(){
     const s = document.createElement('style');
     s.textContent = `
@@ -83,7 +84,7 @@
   new MutationObserver(() => hideGatesHard())
     .observe(document.documentElement, { childList:true, subtree:true });
 
-  // --- Optional: purge illegal localStorage keys so Firestore writes never fail
+  // Purge illegal localStorage keys so Firestore writes never fail
   (function purgeIllegalLocalKeys(){
     const bad = [];
     for (let i = 0; i < localStorage.length; i++) {
@@ -93,7 +94,7 @@
     bad.forEach(k => localStorage.removeItem(k));
   })();
 
-  // --- Build state from localStorage, skipping illegal keys
+  // Build state from localStorage, skipping illegal keys
   function collectLocal() {
     const out = {};
     for (let i = 0; i < localStorage.length; i++) {
@@ -105,19 +106,26 @@
     return out;
   }
 
+  // Apply state; RELOADS ONLY on the *first* pull in this tab
   function applyLocal(state, opts) {
     opts = opts || { reload: false };
     if (!state) return;
+
+    const firstBefore = !sessionStorage.getItem("mg_cloud_applied");
+
     try { localStorage.clear(); } catch {}
     for (const k in state) {
       const v = state[k];
       if (typeof v === "string") localStorage.setItem(k, v);
     }
+
+    // Mark first pull as complete
     FIRST_PULL_DONE = true;
     sessionStorage.setItem("mg_cloud_applied", "1");
     try { document.body.classList.remove('auth-initializing'); } catch {}
-    if (opts.reload && !document.documentElement.dataset.mgReloading) {
-      document.documentElement.dataset.mgReloading = "1";
+
+    // Reload ONLY on the first application (prevents flicker/loops)
+    if (opts.reload && firstBefore) {
       try { location.reload(); } catch {}
     }
   }
@@ -146,18 +154,15 @@
         const d = snap.data();
         applyLocal((d && d.state) || {}, opts);
       } else {
+        // No doc yet; mark first pull so this tab can start saving (no reload)
         FIRST_PULL_DONE = true;
         sessionStorage.setItem("mg_cloud_applied", "1");
         try { document.body.classList.remove('auth-initializing'); } catch {}
-        if (opts.reload && !document.documentElement.dataset.mgReloading) {
-          document.documentElement.dataset.mgReloading = "1";
-          try { location.reload(); } catch {}
-        }
       }
     } catch (e) { console.error(e); }
   }
 
-  // --- Autosave when localStorage changes (BLOCKED until first pull)
+  // Autosave when localStorage changes (BLOCKED until first pull)
   let timer = null;
   function schedule(ms) {
     if (!auth.currentUser) return;
@@ -172,7 +177,7 @@
   const _cl = localStorage.clear.bind(localStorage);
   localStorage.clear = function () { try { _cl(); } finally { schedule(800); } };
 
-  // --- Capture inputs the app might not persist (assumptions/inputs etc.)
+  // Capture inputs the app might not persist
   function stableKey(el) { return el.id || el.name || el.getAttribute("data-field") || null; }
   function storeOverride(el) {
     const key = stableKey(el); if (!key) return;
@@ -205,8 +210,7 @@
   function applyOverridesSoon() { setTimeout(applyOverrides, 400); setTimeout(applyOverrides, 1200); }
   document.addEventListener("DOMContentLoaded", applyOverridesSoon);
 
-  // --- Reveal main UI after successful Firebase auth (debounced & gate-removed)
-  let UI_REVEALED = false;
+  // Reveal main UI after successful Firebase auth (debounced & gate-removed)
   async function revealAppUI(user) {
     if (UI_REVEALED) return;
     UI_REVEALED = true;
@@ -222,12 +226,14 @@
     const who = document.querySelector('#whoami');
     if (who && user?.email) who.textContent = `Signed in as ${user.email}`;
 
-    try { await loadFromCloud({ reload: true }); } catch { try { location.reload(); } catch {} }
+    // Decide once: first pull reloads, subsequent pulls are silent
+    const needFirst = !sessionStorage.getItem('mg_cloud_applied');
+    await loadFromCloud({ reload: needFirst });
 
     try { window.dispatchEvent(new CustomEvent('firebase-auth-success',{detail:{email:user?.email||null}})); } catch {}
   }
 
-  // --- Minimal Supabase auth compatibility so old checks see "logged in"
+  // Minimal Supabase auth compatibility so old checks see "logged in"
   if (!window.supabase) window.supabase = {};
   if (!window.supabase.auth) window.supabase.auth = {};
   window.supabase.createClient = window.supabase.createClient || (() => window.supabase);
@@ -247,33 +253,7 @@
   };
   window.supabase.auth.signOut = async () => { try { await authMod.signOut(auth); } catch {} ; return { error: null }; };
 
-  // --- ALSO hijack any already-created Supabase clients (Chrome-regular only issue)
-  (function hijackExistingSupabaseClients(){
-    try {
-      const compat = {
-        getUser: window.supabase?.auth?.getUser,
-        getSession: window.supabase?.auth?.getSession,
-        onAuthStateChange: window.supabase?.auth?.onAuthStateChange,
-        signOut: window.supabase?.auth?.signOut,
-      };
-      const seen = new Set();
-      for (const k in window) {
-        const v = window[k];
-        if (!v || typeof v !== 'object') continue;
-        if (seen.has(v)) continue; seen.add(v);
-        if (v.auth && typeof v.auth === 'object' && typeof v.from === 'function') {
-          try {
-            v.auth.getUser = compat.getUser;
-            v.auth.getSession = compat.getSession;
-            v.auth.onAuthStateChange = compat.onAuthStateChange;
-            v.auth.signOut = compat.signOut;
-          } catch {}
-        }
-      }
-    } catch {}
-  })();
-
-  // --- Route your UI login buttons to Firebase; block legacy Supabase /auth/v1/ calls
+  // Route your UI login buttons to Firebase; block legacy Supabase /auth/v1/ calls
   (function wireAuthButtonsAndBlockLegacy(){
     const SUPA_AUTH_PATH = '/auth/v1/';
     const origFetch = window.fetch;
@@ -303,8 +283,7 @@
         await authMod.signInWithEmailAndPassword(auth, email, pass);
         console.log('[auth] signed in as', auth.currentUser?.email);
         await revealAppUI(auth.currentUser);
-      } catch (e) {
-        console.error('[auth] sign-in failed', e);
+      } catch (e) { console.error('[auth] sign-in failed', e);
       }
     }
 
@@ -349,18 +328,18 @@
     });
   })();
 
-  // --- If the page loads already authed, pull once automatically
+  // If the page loads already authed, pull once automatically
   window.addEventListener('load', async () => {
     try {
       if (auth.currentUser && !sessionStorage.getItem('mg_cloud_applied') && !UI_REVEALED) {
-        await loadFromCloud({ reload: true });
+        await loadFromCloud({ reload: true }); // first pull only
       } else {
         try { document.body.classList.remove('auth-initializing'); } catch {}
       }
     } catch (e) { console.warn('initial cloud pull on load failed', e); }
   });
 
-  // --- Public API
+  // Public API
   window.saveToCloud   = saveToCloud;
   window.loadFromCloud = function(){ return loadFromCloud({ reload: true }); };
   window.__debugCloud  = async function () {
